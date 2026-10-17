@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+fontes.ini
+
+# Relatórios são output gerado (dado real do BigDataPE): a pasta fica no
+# repo, o conteúdo não. Roda gerar_relatorios_pt.py pra preencher local.
+relatorios/*
+!relatorios/.gitkeep

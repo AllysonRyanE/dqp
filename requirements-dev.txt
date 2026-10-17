@@ -1,0 +1,3 @@
+# Dependências só de desenvolvimento (testes). Não precisa disso pra rodar
+# a pipeline, só pra rodar a suíte em tests/.
+pytest==9.1.1

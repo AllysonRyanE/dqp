@@ -1,0 +1,168 @@
+# Copie este arquivo pra fontes.ini e preencha com valores reais.
+# fontes.ini nunca é commitado (está no .gitignore, igual o .env): cada
+# pessoa usa o próprio.
+#
+# Cada FONTE (o nome escolhido na variável de ambiente FONTE=... do .env ou
+# da linha de comando) mora numa seção própria aqui, identificada por esse
+# mesmo nome entre colchetes. O campo "tipo" dentro da seção decide qual
+# conector roda (trino, postgres, mysql, sqlserver, oracle ou parquet) e,
+# por tabela abaixo, quais outros campos aquele tipo espera:
+#
+#   trino:     host, port, user, password, catalog, schema
+#   postgres:  host, port, user, password, database, schema
+#   mysql:     host, port, user, password, database
+#   sqlserver: host, port, user, password, database, schema (opcional, padrão dbo)
+#   oracle:    host, port, user, password, service_name, schema
+#   parquet:   path (arquivo .parquet específico, glob, ou diretório)
+#
+# Todo tipo também aceita um campo "tables" (tabelas dessa fonte
+# especificamente, separadas por vírgula, sem espaço). Evita ter que repetir
+# TABLES no .env toda vez que troca de FONTE, já que bases diferentes
+# costumam ter tabelas diferentes. Se "tables" ficar ausente (e também não
+# houver TABLES no .env/linha de comando):
+#   - TIPO=parquet: o nome da tabela é derivado do próprio `path`.
+#   - Qualquer outro tipo: cai automaticamente em TABLES=TODAS (modo "base
+#     inteira", descobre e perfila tudo que encontrar no schema/diretório
+#     configurado) em vez de dar erro.
+#
+# Os MESMOS nomes de campo (host, port, user...) se repetem em todas as
+# seções de um mesmo tipo: é a seção que isola uma fonte da outra, então dá
+# pra ter quantas fontes do mesmo tipo quiser, cada uma com seus próprios
+# valores, sem nenhum conflito (ver o par mysql / mysql_teste mais abaixo).
+
+# --- Trino (equivalente ao antigo TRINO_*) ---
+[trino_bigdata]
+tipo = trino
+host = jdbc.bigdata.pe.gov.br
+port = 8443
+user =
+password =
+catalog = servico_hive
+schema = ingestedata
+tables = tabela1,tabela2
+
+# --- Postgres (equivalente ao antigo PG_SOURCE_*) ---
+# `database` vira o `catalogo` gravado em dim_base (no Postgres, o
+# "catálogo" ANSI é o próprio banco de dados da conexão); `schema` é o
+# schema Postgres de fato (ex. "public").
+[postgres_bigdata]
+tipo = postgres
+host =
+port = 5432
+user =
+password =
+database =
+schema = public
+tables = tabela1,tabela2
+
+# --- MySQL (equivalente ao antigo MYSQL_SOURCE_*) ---
+# Via PyMySQL (cursor server-side SSCursor, pra streaming real sem baixar o
+# result set inteiro pro cliente). Em MySQL não existe separação schema vs.
+# database (schema é sinônimo de database), então `database` é usado tanto
+# pra conectar quanto como catalogo/schema_origem gravados em dim_base.
+[mysql]
+tipo = mysql
+host = 127.0.0.1
+port = 3307
+user = dqp_user
+password = dqp_test_pw
+database = dqp_test
+tables = tabela1,tabela2
+
+# Exemplo de uma SEGUNDA fonte do mesmo tipo (mysql), com seus próprios
+# valores: os nomes de campo são idênticos aos da seção acima, sem nenhum
+# conflito, porque cada uma mora na sua própria seção.
+[mysql_teste]
+tipo = mysql
+host = outro-host
+port = 3306
+user = outro_user
+password = outra_senha
+database = outro_banco
+tables = tabela1,tabela2
+
+# --- SQL Server (equivalente ao antigo SQLSERVER_SOURCE_*) ---
+# Via pymssql (não pyodbc: pyodbc exige instalar o driver ODBC da
+# Microsoft a nível de SO, pymssql não exige nenhuma dependência de
+# sistema; ver docstring de extraction/sqlserver_to_duckdb.py). `database`
+# vira o `catalogo` gravado em dim_base; `schema` é o schema dentro desse
+# banco (padrão "dbo" se ausente). Validado via Docker (imagem oficial
+# mcr.microsoft.com/mssql/server, só existe pra Linux a partir do SQL
+# Server 2017): versões anteriores (2012/2014/2016) não são testáveis em
+# Linux e não foram validadas, ainda que o código deva funcionar com elas
+# (protocolo/tipos T-SQL estáveis desde então).
+[sqlserver_local]
+tipo = sqlserver
+host = 127.0.0.1
+port = 14330
+user = sa
+password =
+database = dqp_teste
+schema = dbo
+tables = tabela1,tabela2
+
+# --- Oracle (equivalente ao antigo ORACLE_SOURCE_*) ---
+# Via python-oracledb (sucessor oficial do cx_Oracle, mantido pela própria
+# Oracle) em modo THIN: não exige o Oracle Instant Client instalado no
+# sistema operacional. Oracle não usa "database" simples como
+# Postgres/MySQL/SQL Server: a conexão é feita contra um "service name" (ou
+# SID, legado, não usado aqui). `service_name` vira o `catalogo` gravado em
+# dim_base (o mais próximo de um "catálogo" que o Oracle tem); `schema` é o
+# dono das tabelas dentro desse serviço (o "OWNER" no catálogo Oracle, put
+# em MAIÚSCULO automaticamente antes de comparar no modo TABLES=TODAS).
+# Normalmente o mesmo nome do usuário de conexão, mas pode ser outro schema
+# pro qual o usuário de conexão tenha GRANT. A imagem `gvenzl/oracle-xe`
+# usada na validação expõe o pluggable database padrão como serviço
+# "XEPDB1" (não "XE", que é o CDB raiz).
+#
+# Faixa homologada: testado de ponta a ponta (extração + profiling +
+# persistência no data mart real) contra Oracle 18c XE e 21c XE via Docker
+# (gvenzl/oracle-xe:18-slim e :21-slim). "Deveria funcionar" também em
+# 12c+/19c/23c por compatibilidade de protocolo (mesmo driver em modo
+# thin), mas isso NÃO foi verificado empiricamente. Ver docstring de
+# src/extraction/oracle_to_duckdb.py pras particularidades de tipo (NUMBER
+# sem INTEGER/DECIMAL separados, DATE do Oracle com componente de hora
+# mapeado pra TIMESTAMP no DuckDB: nunca pra DATE, pra não truncar a hora
+# silenciosamente, CLOB/BLOB).
+[oracle_producao]
+tipo = oracle
+host =
+port = 1521
+user =
+password =
+service_name = XEPDB1
+schema =
+tables = tabela1,tabela2
+
+# --- Parquet (equivalente ao antigo PARQUET_SOURCE_PATH) ---
+# Diferente dos tipos acima, não é uma conexão de banco (parquet não tem
+# servidor, usuário, senha): `path` é só um caminho no filesystem, lido
+# diretamente pelo DuckDB via read_parquet(). Aceita:
+#   - um único arquivo:            /dados/vendas.parquet
+#   - um glob de vários arquivos:  /dados/*.parquet
+#   - um glob particionado (Hive): /dados/ano=2024/*.parquet
+#   - um DIRETÓRIO comum, sem glob nenhum: /dados
+#     Nesse caso (modo tabela única, sem TABLES=TODAS) o próprio código
+#     detecta que é um diretório e monta sozinho o glob "/dados/*.parquet"
+#     (não recursivo, não desce em subpastas), tratando TODOS os .parquet
+#     soltos ali dentro como UMA base só, com o total de linhas somado,
+#     não precisa digitar "/*.parquet" na mão.
+# TABLES continua opcional pra essa fonte: sem TABLES, o nome da tabela é
+# derivado do próprio arquivo/diretório em `path` (nome do arquivo sem
+# extensão, ou o diretório mais próximo quando o caminho é um glob sem nome
+# de arquivo fixo, ou o próprio nome da pasta no caso de diretório comum).
+#
+# TABLES=TODAS é o ÚNICO caso em que `path` muda de significado: em vez de
+# um arquivo/glob/diretório comum (sempre UMA tabela), vira um DIRETÓRIO
+# com vários arquivos .parquet DISTINTOS, um por tabela (ex.
+# /dados/vendas.parquet e /dados/produtos.parquet viram as tabelas "vendas"
+# e "produtos"). ATENÇÃO: apontar `path` pro MESMO diretório dá resultado
+# OPOSTO dependendo só de TABLES=TODAS estar ou não definido: sem TODAS, 1
+# base unificada (N arquivos somados); com TODAS, N tabelas separadas (um
+# perfilamento por arquivo). Isso também é diferente do glob particionado
+# Hive de cima (/dados/ano=2024/*.parquet), onde os arquivos são pedaços da
+# MESMA tabela: por isso a descoberta em modo TODAS não desce em
+# subpastas, pra não misturar os dois casos.
+[parquet_local]
+tipo = parquet
+path = /caminho/para/dados.parquet

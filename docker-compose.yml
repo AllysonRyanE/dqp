@@ -1,0 +1,28 @@
+# Sobe um PostgreSQL local pro data mart, sem precisar instalar Postgres na
+# máquina. O esquema (sql/create_schema.sql) roda sozinho na primeira vez que
+# o container sobe (mecanismo nativo da imagem oficial: tudo que está montado
+# em /docker-entrypoint-initdb.d/ é executado automaticamente quando o volume
+# de dados ainda está vazio). Não roda de novo em subidas seguintes.
+#
+# Uso:
+#   docker compose up -d
+#   # preencha o .env com os mesmos valores do bloco "environment" abaixo
+#
+# Credenciais aqui são só pra uso local/dev (o compose não sobe pra lugar
+# nenhum sozinho); troque se for expor a porta além do localhost.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: dqp_datamart
+    environment:
+      POSTGRES_USER: dqp_user
+      POSTGRES_PASSWORD: dqp_senha
+      POSTGRES_DB: dqp_datamart
+    ports:
+      - "5432:5432"
+    volumes:
+      - dqp_datamart_data:/var/lib/postgresql/data
+      - ./sql/create_schema.sql:/docker-entrypoint-initdb.d/create_schema.sql:ro
+
+volumes:
+  dqp_datamart_data:

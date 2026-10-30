@@ -138,15 +138,47 @@ def _buscar_regras(engine: Engine, sk_execucao: int) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-def _buscar_correlacoes_altas(engine: Engine, sk_execucao: int, limiar: float = 0.7) -> List[Dict[str, Any]]:
+def _buscar_matriz_correlacoes(engine: Engine, sk_execucao: int) -> List[Dict[str, Any]]:
     with engine.begin() as conn:
         rows = conn.execute(
             text(
                 """
-                SELECT coluna_a, coluna_b, metodo, valor_correlacao
+                SELECT coluna_a, coluna_b, valor_correlacao
                 FROM fato_correlacao
-                WHERE sk_execucao = :sk_execucao AND ABS(valor_correlacao) >= :limiar
-                ORDER BY ABS(valor_correlacao) DESC
+                WHERE sk_execucao = :sk_execucao
+                """
+            ),
+            {"sk_execucao": sk_execucao},
+        ).mappings().fetchall()
+    return [dict(r) for r in rows]
+
+
+def _buscar_dependencias_funcionais(engine: Engine, sk_execucao: int) -> List[Dict[str, Any]]:
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT coluna_origem, coluna_destino, qtd_grupos_origem,
+                       percentual_grupos_sem_excecao, qtd_linhas_excecao, qtd_linhas_avaliadas
+                FROM fato_dependencia_funcional
+                WHERE sk_execucao = :sk_execucao
+                ORDER BY percentual_grupos_sem_excecao DESC, qtd_grupos_origem DESC
+                """
+            ),
+            {"sk_execucao": sk_execucao},
+        ).mappings().fetchall()
+    return [dict(r) for r in rows]
+
+
+def _buscar_padrao_ausencia_alto(engine: Engine, sk_execucao: int, limiar: float = 0.7) -> List[Dict[str, Any]]:
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT coluna_a, coluna_b, correlacao_nulidade
+                FROM fato_padrao_ausencia
+                WHERE sk_execucao = :sk_execucao AND ABS(correlacao_nulidade) >= :limiar
+                ORDER BY ABS(correlacao_nulidade) DESC
                 LIMIT 30
                 """
             ),
@@ -194,6 +226,9 @@ tr:last-child td { border-bottom: none; }
 .passou { border-left: 4px solid #1a7f37; }
 .rodape { margin-top: 40px; color: #999; font-size: 0.8em; text-align: center; }
 .tag-origem { font-size: 0.75em; padding: 1px 8px; border-radius: 10px; background: #eee; color: #555; }
+table.heatmap { table-layout: fixed; }
+table.heatmap th, table.heatmap td { padding: 4px 6px; font-size: 0.78em; white-space: nowrap; }
+table.heatmap th:first-child { text-align: right; background: #fafafa; }
 """
 
 
@@ -334,16 +369,72 @@ def _tabela_regras_completa(regras: List[Dict[str, Any]]) -> str:
     return f"<table>{cabecalho}{linhas}</table>"
 
 
-def _tabela_correlacoes(correlacoes: List[Dict[str, Any]]) -> str:
-    if not correlacoes:
-        return "<p>Nenhuma correlação forte (≥0,70) encontrada entre colunas.</p>"
-    cabecalho = "<tr><th>Coluna A</th><th>Coluna B</th><th>Método</th><th>Correlação</th></tr>"
+def _cor_heatmap(valor: Optional[float]) -> str:
+    if valor is None:
+        return "#f3f3f3"
+    intensidade = min(abs(valor), 1.0)
+    if valor >= 0:
+        r, g, b = 255, int(255 - 140 * intensidade), int(255 - 220 * intensidade)
+    else:
+        r, g, b = int(255 - 200 * intensidade), int(255 - 90 * intensidade), 255
+    return f"rgb({r},{g},{b})"
+
+
+def _heatmap_correlacoes(pares: List[Dict[str, Any]]) -> str:
+    if not pares:
+        return "<p>Nenhum par de colunas elegível para matriz de correlação nessa execução.</p>"
+
+    colunas = sorted({p["coluna_a"] for p in pares} | {p["coluna_b"] for p in pares})
+    valores = {(p["coluna_a"], p["coluna_b"]): p["valor_correlacao"] for p in pares}
+
+    def _valor(a: str, b: str) -> Optional[float]:
+        if a == b:
+            return 1.0
+        return valores.get((a, b), valores.get((b, a)))
+
+    cabecalho = "<th></th>" + "".join(f"<th>{html.escape(c)}</th>" for c in colunas)
+    linhas = "".join(
+        f"<tr><th>{html.escape(a)}</th>"
+        + "".join(
+            f'<td style="background:{_cor_heatmap(_valor(a, b))};text-align:center">{_fmt(_valor(a, b), casas=2)}</td>'
+            for b in colunas
+        )
+        + "</tr>"
+        for a in colunas
+    )
+    return f'<div style="overflow-x:auto"><table class="heatmap"><tr>{cabecalho}</tr>{linhas}</table></div>'
+
+
+def _tabela_dependencias_funcionais(achados: List[Dict[str, Any]]) -> str:
+    if not achados:
+        return "<p>Nenhuma dependência funcional encontrada entre colunas.</p>"
+    cabecalho = (
+        "<tr><th>Origem → Destino</th><th>Grupos na origem</th>"
+        "<th>% grupos sem exceção</th><th>Linhas de exceção</th><th>Linhas avaliadas</th></tr>"
+    )
     linhas = "".join(
         "<tr>"
-        f"<td>{html.escape(c['coluna_a'])}</td><td>{html.escape(c['coluna_b'])}</td>"
-        f"<td>{html.escape(c['metodo'] or 'auto')}</td><td>{_fmt(c['valor_correlacao'], casas=3)}</td>"
+        f"<td>{html.escape(a['coluna_origem'])} → {html.escape(a['coluna_destino'])}</td>"
+        f"<td>{a['qtd_grupos_origem']}</td>"
+        f"<td>{_fmt(a['percentual_grupos_sem_excecao'], '%')}</td>"
+        f"<td>{a['qtd_linhas_excecao']}</td>"
+        f"<td>{a['qtd_linhas_avaliadas']}</td>"
         "</tr>"
-        for c in correlacoes
+        for a in achados
+    )
+    return f"<table>{cabecalho}{linhas}</table>"
+
+
+def _tabela_padrao_ausencia(pares: List[Dict[str, Any]]) -> str:
+    if not pares:
+        return "<p>Nenhum par de colunas com nulos fortemente correlacionados (≥0,70) encontrado.</p>"
+    cabecalho = "<tr><th>Coluna A</th><th>Coluna B</th><th>Correlação de nulidade</th></tr>"
+    linhas = "".join(
+        "<tr>"
+        f"<td>{html.escape(p['coluna_a'])}</td><td>{html.escape(p['coluna_b'])}</td>"
+        f"<td>{_fmt(p['correlacao_nulidade'], casas=3)}</td>"
+        "</tr>"
+        for p in pares
     )
     return f"<table>{cabecalho}{linhas}</table>"
 
@@ -383,7 +474,9 @@ def gerar_html_detalhado(engine: Engine, nome_base: str, sk_execucao: Optional[i
     sk_execucao_real = execucao["sk_execucao"]
     colunas = _buscar_colunas(engine, sk_execucao_real)
     regras = _buscar_regras(engine, sk_execucao_real)
-    correlacoes = _buscar_correlacoes_altas(engine, sk_execucao_real)
+    matriz_correlacoes = _buscar_matriz_correlacoes(engine, sk_execucao_real)
+    dependencias_funcionais = _buscar_dependencias_funcionais(engine, sk_execucao_real)
+    padrao_ausencia_alto = _buscar_padrao_ausencia_alto(engine, sk_execucao_real)
     duplicatas = _buscar_duplicatas_amostra(engine, sk_execucao_real)
 
     bloco_duplicatas = ""
@@ -400,8 +493,12 @@ def gerar_html_detalhado(engine: Engine, nome_base: str, sk_execucao: Optional[i
 {_tabela_colunas_completa(colunas)}
 <h2>Alertas do sistema e regras de negócio</h2>
 {_tabela_regras_completa(regras)}
-<h2>Correlações fortes entre colunas (|r| ≥ 0,70)</h2>
-{_tabela_correlacoes(correlacoes)}
+<h2>Matriz de correlação entre colunas</h2>
+{_heatmap_correlacoes(matriz_correlacoes)}
+<h2>Dependências funcionais encontradas</h2>
+{_tabela_dependencias_funcionais(dependencias_funcionais)}
+<h2>Padrão de ausência: colunas com nulos correlacionados (≥0,70)</h2>
+{_tabela_padrao_ausencia(padrao_ausencia_alto)}
 {bloco_duplicatas}
 {_rodape()}
 </body></html>"""

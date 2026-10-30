@@ -96,6 +96,8 @@ FONTE=<nome> TABLES=TODAS .venv/bin/python persistir_datamart_duckdb.py
 
 Se `tables` não estiver preenchido em `fontes.ini`, a pipeline assume `TABLES=TODAS` automaticamente. Também é possível definir uma `FONTE` padrão no próprio `.env`, usada quando a variável não é passada na linha de comando.
 
+Toda execução grava, além de imprimir no terminal, um log completo em `logs/` (nomeado com a fonte e o timestamp, ex.: `logs/persistir_datamart_duckdb_jm_dayane_kna1_20261021_122944.log`), útil para conferir depois o que uma execução específica fez sem depender do histórico do terminal.
+
 ## Passo 3: consultar os resultados
 
 Direto no PostgreSQL do data mart, com as credenciais do `.env` (`PG_DATAMART_*`), por linha de comando ou por ferramentas gráficas (DBeaver, pgAdmin):
@@ -129,6 +131,24 @@ Gera relatórios HTML autocontidos (um executivo e um detalhado) a partir do que
 ```
 
 Os arquivos são salvos em `relatorios/`, prontos para abrir em qualquer navegador.
+
+## Funcionalidade opcional: apagar os dados de uma fonte
+
+Em ambientes de teste é comum perfilar a mesma fonte várias vezes enquanto o schema do data mart ainda está mudando, o que deixa execuções antigas e incompletas acumuladas. `truncar_fonte.py` remove, de uma fonte específica, a base (`dim_base`/`dim_atributo`) e todos os fatos associados:
+
+```bash
+# só mostra o que seria apagado (modo padrão, nada é tocado)
+FONTE=<nome> .venv/bin/python truncar_fonte.py
+
+# apaga de fato
+FONTE=<nome> .venv/bin/python truncar_fonte.py --confirmar
+
+# aceita um padrão SQL LIKE para apagar várias fontes de uma vez,
+# útil quando várias seções de fontes.ini compartilham um prefixo comum
+FONTE='jm_dayane_%' .venv/bin/python truncar_fonte.py --confirmar
+```
+
+A operação roda numa única transação (tudo ou nada) e também grava seu próprio log em `logs/`.
 
 ## Testes
 

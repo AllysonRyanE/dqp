@@ -3,11 +3,10 @@ Motor de regras de negócio configuradas pelo usuário (origem='usuario' em
 fato_regra_aplicada). Roda contra o mesmo arquivo DuckDB que o DuckDBProfiler
 usa: não depende do ydata-profiling nem do pandas.
 
-Combina Great Expectations (regras de coluna única/composta, onde ele é a
-ferramenta certa) com SQL direto (regras entre tabelas ou cálculos
-específicos, onde GE fica artificial demais). Great Expectations valida
-direto contra o SQLAlchemy engine via `duckdb_engine`, sem carregar nada em
-pandas: mesmo princípio de "sem amostragem" do DuckDBProfiler.
+Combina Great Expectations (regras de coluna única/composta) com SQL direto
+(regras entre tabelas ou cálculos específicos, onde GE fica artificial
+demais). GE valida direto contra o SQLAlchemy engine via `duckdb_engine`,
+sem carregar nada em pandas.
 
 Contrato de `parametros` por código de regra (dim_regra.codigo):
     valores_distintos_entre  {"coluna": str, "minimo": int, "maximo": int}
@@ -23,7 +22,7 @@ Contrato de `parametros` por código de regra (dim_regra.codigo):
     existe_em_outra_tabela   {"coluna": str, "tabela_referencia": str, "coluna_referencia": str}
     completude_condicional   {"coluna_condicionante": str, "coluna_dependente": str}
     nulidade_aceitavel       {"coluna": str, "tolerancia_percentual": float}: única regra que também
-                             altera o cálculo de score_completude (ver quality_scorer.py); as outras 11
+                             altera o cálculo de score_completude (ver quality_scorer.py), as outras 11
                              só registram passou/falhou, essa muda a fórmula da dimensão.
 
 Cada regra de entrada é um dict {"sk_config_regra": int, "codigo": str, "parametros": dict}.
@@ -42,18 +41,13 @@ from sqlalchemy import text
 
 
 class _DuckDBDialectMarker:
-    """GE 1.19.1 fecha a conexão SQLAlchemy assim que uma query termina
-    (`SqlAlchemyExecutionEngine.get_connection`): funciona pra dialetos que
-    bufferizam o resultado inteiro no client (psycopg2, etc), mas o driver
-    Python do DuckDB invalida o cursor quando a conexão-mãe fecha, então
-    `resolve_metric_bundle` recebe uma lista vazia e explode com
-    `IndexError: list index out of range` mesmo pra métricas triviais como
-    `table.row_count`. GE já tem uma lista de dialetos que usam conexão
-    persistida (`_PERSISTED_CONNECTION_DIALECTS`, ex: sqlite, mssql): só que
-    "duckdb" nunca foi adicionado lá (não existe nem como GXSqlDialect). Esse
-    marcador imita um membro do enum (precisa de `.value` e de comparar por
-    igualdade com a string "duckdb") pra entrar nessa lista via monkeypatch,
-    sem precisar (nem poder) estender o Enum do GE diretamente."""
+    """GE 1.19.1 fecha a conexão SQLAlchemy assim que uma query termina, mas
+    o driver do DuckDB invalida o cursor quando a conexão-mãe fecha, então
+    `resolve_metric_bundle` explode com `IndexError` em métricas triviais.
+    GE tem uma lista de dialetos que usam conexão persistida
+    (`_PERSISTED_CONNECTION_DIALECTS`), mas "duckdb" nunca foi adicionado
+    lá. Esse marcador imita um membro do enum pra entrar nessa lista via
+    monkeypatch, sem precisar estender o Enum do GE diretamente."""
 
     value = "duckdb"
 
@@ -385,7 +379,7 @@ def _nulidade_aceitavel(tabela, p, regra, motor_ge):
     (persistir_datamart_duckdb.py) e repassado pro QualityScorer, que deixa
     de penalizar score_completude até esse limite: ver
     calculate_completeness_score em quality_scorer.py. Essa função aqui só
-    cuida do registro/relato; quem muda o score é o scorer."""
+    cuida do registro/relato, quem muda o score é o scorer."""
     coluna = p["coluna"]
     tolerancia = p["tolerancia_percentual"]
     nulos, total = motor_ge.executar(f'SELECT COUNT(*) FILTER (WHERE "{coluna}" IS NULL), COUNT(*) FROM "{tabela}"')
@@ -459,10 +453,8 @@ def avaliar_regras(caminho_duckdb: str, tabela: str, regras: List[Dict[str, Any]
 
     motor_ge.encerrar()
     del motor_ge
-    # O GE monta o SQLAlchemy Engine/Connection num ciclo de referências (engine
-    # <-> pool <-> connection <-> dialect) que o refcounting normal do CPython não
-    # derruba na hora: sem isso, o handle do arquivo DuckDB fica preso até o GC
-    # cíclico rodar sozinho (não determinístico), e a próxima tabela não consegue
-    # abrir uma conexão nova pro mesmo arquivo.
+    # O GE monta um ciclo de referências (engine <-> pool <-> connection) que
+    # o refcounting normal não derruba: sem isso, o handle do DuckDB fica
+    # preso até o GC cíclico rodar sozinho, travando a próxima tabela.
     gc.collect()
     return resultados

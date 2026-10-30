@@ -126,12 +126,18 @@ CREATE TABLE fato_perfilamento_coluna (
     -- Moda / concentração categórica
     valor_moda TEXT,
     frequencia_moda BIGINT,
+    frequencia_minima_valor BIGINT,
+    frequencia_mediana_valor NUMERIC,
     percentual_valor_mais_frequente NUMERIC(6, 3),
     indice_concentracao_categorica NUMERIC(6, 4),
 
     -- Datas
     qtd_datas_invalidas BIGINT,
     percentual_datas_invalidas NUMERIC(6, 3),
+    distribuicao_dia_semana JSONB,       -- ex: {"Monday": 120, "Tuesday": 98, ...}
+    intervalo_minimo_dias INTEGER,
+    intervalo_mediano_dias NUMERIC,
+    intervalo_maximo_dias INTEGER,
 
     -- Memória
     tamanho_memoria_bytes BIGINT,
@@ -177,6 +183,7 @@ CREATE TABLE fato_perfilamento_base (
     qtd_celulas_nulas BIGINT,
     percentual_celulas_nulas NUMERIC(6, 3),
     qtd_colunas_com_nulo INTEGER,
+    qtd_colunas_totalmente_nulas INTEGER,
     qtd_linhas_duplicadas BIGINT,
     percentual_linhas_duplicadas NUMERIC(6, 3),
     tamanho_memoria_bytes BIGINT,
@@ -216,6 +223,24 @@ CREATE TABLE fato_correlacao (
 );
 
 CREATE INDEX idx_fcorr_execucao ON fato_correlacao (sk_execucao);
+
+-- Dependência funcional (origem -> destino): descoberta automática pelo
+-- DuckDBProfiler, não regra declarada pelo usuário (ver config_regra_usuario
+-- pra essa). Direcional, por isso coluna_origem/coluna_destino não são
+-- intercambiáveis como em fato_correlacao: o achado A->B não implica B->A.
+CREATE TABLE fato_dependencia_funcional (
+    sk_dependencia_funcional BIGSERIAL PRIMARY KEY,
+    sk_execucao BIGINT NOT NULL REFERENCES dim_execucao (sk_execucao),
+    sk_base INTEGER NOT NULL REFERENCES dim_base (sk_base),
+    coluna_origem VARCHAR(200) NOT NULL,
+    coluna_destino VARCHAR(200) NOT NULL,
+    qtd_grupos_origem BIGINT,
+    percentual_grupos_sem_excecao NUMERIC(6, 3),
+    qtd_linhas_excecao BIGINT,
+    qtd_linhas_avaliadas BIGINT
+);
+
+CREATE INDEX idx_fdf_execucao ON fato_dependencia_funcional (sk_execucao);
 
 CREATE TABLE fato_padrao_ausencia (
     sk_padrao_ausencia BIGSERIAL PRIMARY KEY,
@@ -272,7 +297,8 @@ INSERT INTO dim_regra (codigo, nome_exibicao, descricao, categoria) VALUES
     ('cardinalidade_muito_alta', 'Cardinalidade muito alta', 'Quase todo valor é distinto: possível identificador/hash', 'sistema'),
     ('muitos_zeros', 'Muitos valores zero', 'Percentual alto de zeros na coluna', 'sistema'),
     ('muitos_negativos', 'Muitos valores negativos', 'Percentual alto de valores negativos na coluna', 'sistema'),
-    ('tipo_fisico_divergente', 'Tipo físico divergente do conteúdo', 'Coluna declarada como texto no banco de origem, mas o conteúdo é majoritariamente parseável como número ou data', 'sistema');
+    ('tipo_fisico_divergente', 'Tipo físico divergente do conteúdo', 'Coluna declarada como texto no banco de origem, mas o conteúdo é majoritariamente parseável como número ou data', 'sistema'),
+    ('dependencia_funcional_com_excecoes', 'Dependência funcional com exceções', 'Uma dependência funcional descoberta automaticamente (origem determina destino) tem linhas que quebram a regra, mesmo acima do limiar de aderência', 'sistema');
 
 -- Regras de negócio que o usuário configurou (grão: 1 regra ativa por base).
 -- `parametros` guarda os campos específicos de cada tipo (colunas envolvidas,
@@ -321,51 +347,80 @@ CREATE INDEX idx_fra_tipo ON fato_regra_aplicada (sk_regra_tipo);
 -- VIEWS (conveniência: nome_base/nome_coluna já embutidos, sem JOIN manual)
 -- =============================================================================
 
+-- As três views abaixo mostram só a execução mais recente por base/atributo
+-- (ROW_NUMBER() particionado, rn = 1): sem isso, uma base perfilada mais de
+-- uma vez (comum em ambiente de teste, enquanto o schema ainda muda) aparece
+-- duplicada em quem consulta sem filtrar por execução — aconteceu de verdade
+-- com dependência funcional e padrão de ausência numa mesma análise (B8).
+-- Quem precisar do histórico completo consulta a tabela fato diretamente.
 CREATE OR REPLACE VIEW vw_perfilamento_base AS
+WITH ultima AS (
+    SELECT
+        b.*, ex.data_hora_execucao, ex.modo_coleta,
+        ROW_NUMBER() OVER (PARTITION BY b.sk_base ORDER BY ex.data_hora_execucao DESC) AS rn
+    FROM fato_perfilamento_base b
+    JOIN dim_execucao ex ON ex.sk_execucao = b.sk_execucao
+)
 SELECT
     d.nome_base, d.catalogo, d.schema_origem,
-    ex.data_hora_execucao, ex.modo_coleta,
-    b.qtd_linhas, b.qtd_colunas, b.qtd_celulas_nulas, b.percentual_celulas_nulas,
-    b.qtd_colunas_com_nulo, b.qtd_linhas_duplicadas, b.percentual_linhas_duplicadas,
-    pg_size_pretty(b.tamanho_memoria_bytes::bigint) AS tamanho_memoria,
-    b.tamanho_medio_registro, b.tipos_coluna, b.qtd_alertas, b.alertas,
-    b.score_final_base, b.classificacao_final_base,
-    b.score_final_execucao_anterior, b.variacao_score_final,
-    b.percentual_variacao_qtd_linhas, b.dias_desde_execucao_anterior, b.qtd_execucoes_anteriores,
-    b.sk_perfilamento_base
-FROM fato_perfilamento_base b
-JOIN dim_base d ON d.sk_base = b.sk_base
-JOIN dim_execucao ex ON ex.sk_execucao = b.sk_execucao;
+    u.data_hora_execucao, u.modo_coleta,
+    u.qtd_linhas, u.qtd_colunas, u.qtd_celulas_nulas, u.percentual_celulas_nulas,
+    u.qtd_colunas_com_nulo, u.qtd_linhas_duplicadas, u.percentual_linhas_duplicadas,
+    pg_size_pretty(u.tamanho_memoria_bytes::bigint) AS tamanho_memoria,
+    u.tamanho_medio_registro, u.tipos_coluna, u.qtd_alertas, u.alertas,
+    u.score_final_base, u.classificacao_final_base,
+    u.score_final_execucao_anterior, u.variacao_score_final,
+    u.percentual_variacao_qtd_linhas, u.dias_desde_execucao_anterior, u.qtd_execucoes_anteriores,
+    u.sk_perfilamento_base,
+    u.qtd_colunas_totalmente_nulas
+FROM ultima u
+JOIN dim_base d ON d.sk_base = u.sk_base
+WHERE u.rn = 1;
 
 CREATE OR REPLACE VIEW vw_perfilamento_coluna AS
+WITH ultima AS (
+    SELECT
+        f.*, ex.data_hora_execucao, ex.modo_coleta,
+        ROW_NUMBER() OVER (PARTITION BY f.sk_atributo ORDER BY ex.data_hora_execucao DESC) AS rn
+    FROM fato_perfilamento_coluna f
+    JOIN dim_execucao ex ON ex.sk_execucao = f.sk_execucao
+)
 SELECT
     d.nome_base,
     a.nome_coluna, a.posicao_coluna,
-    ex.data_hora_execucao, ex.modo_coleta,
-    f.qtd_linhas_total, f.qtd_valores_nulos, f.percentual_valores_nulos,
-    f.qtd_valores_distintos, f.percentual_valores_distintos, f.qtd_valores_repetidos,
-    f.tipo_dado_inferido, f.percentual_valores_parseaveis_numero, f.percentual_valores_parseaveis_data,
-    f.valor_minimo, f.valor_maximo, f.data_minima, f.data_maxima,
-    f.valor_medio, f.valor_mediano, f.desvio_padrao, f.variancia,
-    f.assimetria, f.curtose, f.percentil_25, f.percentil_75, f.coeficiente_variacao,
-    f.qtd_valores_zero, f.percentual_valores_zero, f.qtd_valores_negativos, f.percentual_valores_negativos,
-    f.qtd_valores_infinitos, f.qtd_outliers, f.percentual_outliers,
-    f.tamanho_medio_texto, f.tamanho_mediano_texto, f.tamanho_maximo_texto, f.tamanho_minimo_texto,
-    f.qtd_caracteres_distintos, f.valor_moda, f.frequencia_moda, f.percentual_valor_mais_frequente,
-    f.indice_concentracao_categorica, f.qtd_datas_invalidas, f.percentual_datas_invalidas,
-    pg_size_pretty(f.tamanho_memoria_bytes::bigint) AS tamanho_memoria,
-    f.score_completude, f.score_unicidade, f.score_consistencia, f.score_acuracia, f.score_atualidade,
-    f.score_conformidade_regras,
-    f.score_geral, f.classificacao,
-    f.score_geral_execucao_anterior, f.variacao_score_geral, f.percentual_variacao_qtd_linhas,
-    f.variacao_percentual_valor_mais_frequente, f.dias_desde_execucao_anterior, f.qtd_execucoes_anteriores,
-    f.sk_perfilamento_coluna
-FROM fato_perfilamento_coluna f
-JOIN dim_atributo a ON a.sk_atributo = f.sk_atributo
-JOIN dim_base d ON d.sk_base = f.sk_base
-JOIN dim_execucao ex ON ex.sk_execucao = f.sk_execucao;
+    u.data_hora_execucao, u.modo_coleta,
+    u.qtd_linhas_total, u.qtd_valores_nulos, u.percentual_valores_nulos,
+    u.qtd_valores_distintos, u.percentual_valores_distintos, u.qtd_valores_repetidos,
+    u.tipo_dado_inferido, u.percentual_valores_parseaveis_numero, u.percentual_valores_parseaveis_data,
+    u.valor_minimo, u.valor_maximo, u.data_minima, u.data_maxima,
+    u.valor_medio, u.valor_mediano, u.desvio_padrao, u.variancia,
+    u.assimetria, u.curtose, u.percentil_25, u.percentil_75, u.coeficiente_variacao,
+    u.qtd_valores_zero, u.percentual_valores_zero, u.qtd_valores_negativos, u.percentual_valores_negativos,
+    u.qtd_valores_infinitos, u.qtd_outliers, u.percentual_outliers,
+    u.tamanho_medio_texto, u.tamanho_mediano_texto, u.tamanho_maximo_texto, u.tamanho_minimo_texto,
+    u.qtd_caracteres_distintos, u.valor_moda, u.frequencia_moda, u.percentual_valor_mais_frequente,
+    u.indice_concentracao_categorica, u.qtd_datas_invalidas, u.percentual_datas_invalidas,
+    pg_size_pretty(u.tamanho_memoria_bytes::bigint) AS tamanho_memoria,
+    u.score_completude, u.score_unicidade, u.score_consistencia, u.score_acuracia, u.score_atualidade,
+    u.score_conformidade_regras,
+    u.score_geral, u.classificacao,
+    u.score_geral_execucao_anterior, u.variacao_score_geral, u.percentual_variacao_qtd_linhas,
+    u.variacao_percentual_valor_mais_frequente, u.dias_desde_execucao_anterior, u.qtd_execucoes_anteriores,
+    u.sk_perfilamento_coluna,
+    u.frequencia_minima_valor, u.frequencia_mediana_valor,
+    u.distribuicao_dia_semana, u.intervalo_minimo_dias, u.intervalo_mediano_dias, u.intervalo_maximo_dias
+FROM ultima u
+JOIN dim_atributo a ON a.sk_atributo = u.sk_atributo
+JOIN dim_base d ON d.sk_base = u.sk_base
+WHERE u.rn = 1;
 
 CREATE OR REPLACE VIEW vw_regras_aplicadas AS
+WITH ultima_execucao_por_base AS (
+    SELECT fra.sk_base, MAX(ex.data_hora_execucao) AS data_hora_execucao
+    FROM fato_regra_aplicada fra
+    JOIN dim_execucao ex ON ex.sk_execucao = fra.sk_execucao
+    GROUP BY fra.sk_base
+)
 SELECT
     d.nome_base, a.nome_coluna,
     ex.data_hora_execucao,
@@ -376,4 +431,5 @@ FROM fato_regra_aplicada fra
 JOIN dim_regra r ON r.sk_regra_tipo = fra.sk_regra_tipo
 JOIN dim_base d ON d.sk_base = fra.sk_base
 JOIN dim_execucao ex ON ex.sk_execucao = fra.sk_execucao
+JOIN ultima_execucao_por_base u ON u.sk_base = fra.sk_base AND u.data_hora_execucao = ex.data_hora_execucao
 LEFT JOIN dim_atributo a ON a.sk_atributo = fra.sk_atributo;

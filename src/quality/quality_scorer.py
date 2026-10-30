@@ -10,7 +10,7 @@ class QualityScores:
     unicidade: float
     consistencia: Optional[float]  # None quando não se aplica ao tipo da coluna
     acuracia: Optional[float]  # None quando não se aplica ao tipo da coluna
-    atualidade: Optional[float]  # só se aplica a colunas DateTime; None nas demais
+    atualidade: Optional[float]  # só se aplica a colunas DateTime, None nas demais
     conformidade_regras: Optional[float]  # None quando a coluna não tem regra de usuário configurada
     score_geral: float
     classificacao: str  # Crítico, Regular, Ótimo
@@ -26,22 +26,12 @@ class QualityScorer:
         Args:
             weights: Pesos para cada dimensão no cálculo do score geral
         """
-        # Unicidade NÃO entra aqui: é subjetiva (uma coluna pode repetir
-        # muito por natureza, ex: categoria/FK, sem isso ser defeito de
-        # qualidade). Continua calculada e disponível na coluna score_unicidade,
-        # só não pondera o score_geral. Pesos originais eram 30/25/25/20
-        # (completude/unicidade/consistência/acurácia): removendo a fatia de
-        # unicidade (25) e renormalizando os outros 3 proporcionalmente sobre
-        # 75: 30/75, 25/75, 20/75 = 6/15, 5/15, 4/15.
-        #
-        # conformidade_regras é uma dimensão nova (regras de negócio que o
-        # usuário configura, ex: GE contra DuckDB): só entra quando a coluna
-        # tem pelo menos uma regra ativa (ver calculate_rule_conformity_score).
-        # O peso 5 foi escolhido só pra manter a MESMA proporção 6:5:4 entre
-        # completude/consistência/acurácia de antes: quando nenhuma regra se
-        # aplica (caso comum hoje), a renormalização em calculate_overall_score
-        # cai exatamente nos pesos 6/15, 5/15, 4/15 de antes: comportamento
-        # idêntico ao pré-regras pra qualquer coluna sem regra configurada.
+        # Unicidade não entra aqui: é subjetiva (uma coluna pode repetir
+        # muito por natureza, ex: FK), continua calculada à parte em
+        # score_unicidade. conformidade_regras só entra quando a coluna tem
+        # ao menos uma regra ativa; seu peso (5) mantém a mesma proporção
+        # 6:5:4 entre completude/consistência/acurácia de antes, então uma
+        # coluna sem regra renormaliza pros mesmos pesos do pré-regras.
         self.weights = weights or {
             "completude": 6 / 20,
             "consistencia": 5 / 20,
@@ -62,7 +52,7 @@ class QualityScorer:
         `tolerancia_nulidade` vem da regra de usuário 'nulidade_aceitavel'
         (config_regra_usuario): quando definida, os primeiros X% de nulos
         são "de graça" (não penalizam), só o que passa da tolerância conta.
-        Ex: 30% nulos com tolerância de 30% -> completude 100; com tolerância
+        Ex: 30% nulos com tolerância de 30% -> completude 100. Com tolerância
         de 10% -> só os 20 pontos excedentes penalizam.
         """
         percentual_nulos = metrics.get("percentual_nulos", 0.0)
@@ -85,19 +75,14 @@ class QualityScorer:
 
     def calculate_consistency_score(self, metrics: Dict[str, Any]) -> Optional[float]:
         """
-        Score de Consistência: coerência interna de tipagem da coluna
-        (não depende de regra de negócio manual). Só é calculada de verdade
-        pra DateTime e Text/Categorical: nos demais tipos, ou quando não deu
-        pra medir (ex: guarda de segfault em string longa), retorna None
-        (não se aplica) em vez de um 100 automático, pra não inflar o
-        score_geral com uma dimensão que nem foi avaliada.
+        Score de Consistência: coerência interna de tipagem da coluna. Só
+        calculada pra DateTime e Text/Categorical; nos demais tipos retorna
+        None (não se aplica), pra não inflar o score_geral.
 
-        - DateTime: % de valores que não conformam ao formato de data esperado.
+        - DateTime: % de valores que não conformam ao formato esperado.
         - Text/Categorical: o quanto a coluna está "misturada" entre parecer
-          número/data e não parecer. Tudo de um jeito só (0% ou 100% parseável)
-          é consistente, mesmo que seja o tipo "errado": isso é avaliado em
-          outra dimensão (tipagem). Metade-metade é o pior caso (mistura real).
-        - Numeric e demais tipos: dimensão não se aplica.
+          número/data e não parecer; metade-metade é o pior caso.
+        - Numeric e demais tipos: não se aplica.
         """
         tipo = metrics.get("tipo_dado_inferido")
 
@@ -134,15 +119,9 @@ class QualityScorer:
         return max(0.0, 100.0 * (1 - percentual_outliers / 100.0))
 
     def calculate_timeliness_score(self, metrics: Dict[str, Any]) -> Optional[float]:
-        """
-        Score de Atualidade: só se aplica a colunas DateTime: mede quão
-        recente é a própria distribuição de datas da coluna (dias corridos
-        entre hoje e o valor máximo de data encontrado nela). Não é
-        "há quanto tempo a base foi atualizada" nem "há quanto tempo rodamos
-        o profiling": é uma leitura de frescor daquela coluna especificamente.
-        Não entra no score_geral (é informativo, não é dimensão de qualidade
-        universal: nem toda coluna tem data pra medir isso).
-        """
+        """Score de Atualidade: só se aplica a colunas DateTime, mede dias
+        corridos entre hoje e a data máxima da coluna. Não entra no
+        score_geral: é informativo, nem toda coluna tem data pra medir."""
         if metrics.get("tipo_dado_inferido") != "DateTime":
             return None
 
@@ -173,17 +152,10 @@ class QualityScorer:
     def calculate_rule_conformity_score(
         self, nome_coluna: str, resultados_regras_usuario: Optional[List[Dict[str, Any]]]
     ) -> Optional[float]:
-        """
-        Score de Conformidade de Regras: média do `percentual_conformidade` de
-        toda regra de usuário (origem='usuario') que envolve essa coluna,
-        tanto regras de coluna única quanto multi-coluna/tabela (chave
-        composta, soma, completude condicional etc), identificadas por
-        `colunas_envolvidas` conter o nome da coluna.
-
-        None quando a coluna não tem nenhuma regra ativa configurada: mesma
-        convenção de "não se aplica" usada em consistência/acurácia, pra não
-        inflar nem penalizar o score_geral de colunas sem regra nenhuma.
-        """
+        """Score de Conformidade de Regras: média do `percentual_conformidade`
+        de toda regra de usuário que envolve essa coluna (identificadas por
+        `colunas_envolvidas`). None quando não há regra ativa, mesma
+        convenção de "não se aplica" de consistência/acurácia."""
         if not resultados_regras_usuario:
             return None
 
@@ -205,14 +177,10 @@ class QualityScorer:
         score_acuracia: Optional[float],
         score_conformidade_regras: Optional[float] = None,
     ) -> float:
-        """
-        Score Geral: média ponderada das dimensões que de fato se aplicam
-        àquela coluna (completude sempre entra; as demais só quando não são
-        None). O peso das dimensões ausentes é redistribuído proporcionalmente
-        entre as que restam, em vez de contar um 100 "de mentirinha" pra
-        dimensão que nem foi medida: isso é o que antes fazia quase toda
-        coluna virar Ótimo.
-        """
+        """Score Geral: média ponderada das dimensões que se aplicam à
+        coluna (completude sempre entra). O peso das ausentes é
+        redistribuído entre as que restam, em vez de contar um 100 pra
+        dimensão não medida, o que antes fazia quase tudo virar Ótimo."""
         dimensoes = [
             ("completude", score_completude),
             ("consistencia", score_consistencia),

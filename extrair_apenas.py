@@ -22,19 +22,39 @@ Uso: FONTE=<nome> .venv/bin/python extrair_apenas.py <nome_da_tabela> [limite]
 import configparser
 import os
 import sys
+from datetime import datetime
 
 import trino
 from dotenv import load_dotenv
+from loguru import logger
+
+# Antes de qualquer import de src/: ver o mesmo comentário em
+# persistir_datamart_duckdb.py (módulos de src/ podem ler o ambiente na
+# hora da importação).
+load_dotenv()
 
 sys.path.insert(0, "src")
 
 from data_mart.loader import DataMartLoader  # noqa: E402
 from extraction.trino_to_duckdb import extrair_para_duckdb  # noqa: E402
 
-load_dotenv()
-
 CAMINHO_DUCKDB = "/tmp/dqp_extrato.duckdb"
 CAMINHO_FONTES_INI = "fontes.ini"
+
+
+class _TeeStdout:
+    def __init__(self, destino_original, caminho_arquivo):
+        self._original = destino_original
+        self._arquivo = open(caminho_arquivo, "a", encoding="utf-8")
+
+    def write(self, texto):
+        self._original.write(texto)
+        self._arquivo.write(texto)
+        return len(texto)
+
+    def flush(self):
+        self._original.flush()
+        self._arquivo.flush()
 
 
 def _carregar_secao_fonte_trino(fonte: str) -> dict:
@@ -85,6 +105,15 @@ def main():
         print("FONTE não definida: ex.: FONTE=trino_bigdata .venv/bin/python extrair_apenas.py <tabela>")
         sys.exit(1)
     secao_fonte = _carregar_secao_fonte_trino(fonte)
+
+    # Grava um log de execução em logs/, além do terminal (loguru + print()
+    # soltos, via Tee): mesmo motivo de persistir_datamart_duckdb.py (ver
+    # comentário lá).
+    os.makedirs("logs", exist_ok=True)
+    timestamp_log = datetime.now().strftime("%Y%m%d_%H%M%S")
+    caminho_log = f"logs/extrair_apenas_{fonte}_{timestamp_log}.log"
+    logger.add(caminho_log, level="DEBUG", encoding="utf-8")
+    sys.stdout = _TeeStdout(sys.stdout, caminho_log)
 
     table_name = sys.argv[1]
     limite = int(sys.argv[2]) if len(sys.argv) > 2 else None

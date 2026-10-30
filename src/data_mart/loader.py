@@ -326,6 +326,9 @@ class DataMartLoader:
         resultados_regras_usuario: Optional[List[Dict[str, Any]]] = None,
     ) -> int:
         agora = datetime.now()
+        # Calculado uma vez e reaproveitado em fato_perfilamento_base e no
+        # loop de fato_regra_aplicada, que antes usavam listas diferentes.
+        alertas_automaticos = gerar_alertas_automaticos(full)
 
         with self.engine.begin() as conn:
             sk_calendario = self.get_or_create_calendario(conn, agora)
@@ -348,7 +351,7 @@ class DataMartLoader:
                     historico["variacao_score_geral"] = round(scores.score_geral - historico["score_geral_execucao_anterior"], 2)
 
                 eh_numerico = metrics.get("tipo_dado_inferido") == "Numeric"
-                eh_data = metrics.get("tipo_dado_inferido") == "DateTime"
+                eh_data = metrics.get("tipo_dado_inferido") in ("DateTime", "Time")
 
                 conn.execute(
                     text(
@@ -363,8 +366,10 @@ class DataMartLoader:
                             qtd_valores_zero, percentual_valores_zero, qtd_valores_negativos, percentual_valores_negativos,
                             qtd_valores_infinitos, qtd_outliers, percentual_outliers,
                             tamanho_medio_texto, tamanho_mediano_texto, tamanho_maximo_texto, tamanho_minimo_texto,
-                            qtd_caracteres_distintos, valor_moda, frequencia_moda, percentual_valor_mais_frequente,
+                            qtd_caracteres_distintos, valor_moda, frequencia_moda,
+                            frequencia_minima_valor, frequencia_mediana_valor, percentual_valor_mais_frequente,
                             indice_concentracao_categorica, qtd_datas_invalidas, percentual_datas_invalidas,
+                            distribuicao_dia_semana, intervalo_minimo_dias, intervalo_mediano_dias, intervalo_maximo_dias,
                             tamanho_memoria_bytes,
                             score_completude, score_unicidade, score_consistencia, score_acuracia, score_atualidade,
                             score_conformidade_regras,
@@ -381,8 +386,10 @@ class DataMartLoader:
                             :qtd_valores_zero, :percentual_valores_zero, :qtd_valores_negativos, :percentual_valores_negativos,
                             :qtd_valores_infinitos, :qtd_outliers, :percentual_outliers,
                             :tamanho_medio_texto, :tamanho_mediano_texto, :tamanho_maximo_texto, :tamanho_minimo_texto,
-                            :qtd_caracteres_distintos, :valor_moda, :frequencia_moda, :percentual_valor_mais_frequente,
+                            :qtd_caracteres_distintos, :valor_moda, :frequencia_moda,
+                            :frequencia_minima_valor, :frequencia_mediana_valor, :percentual_valor_mais_frequente,
                             :indice_concentracao_categorica, :qtd_datas_invalidas, :percentual_datas_invalidas,
+                            CAST(:distribuicao_dia_semana AS jsonb), :intervalo_minimo_dias, :intervalo_mediano_dias, :intervalo_maximo_dias,
                             :tamanho_memoria_bytes,
                             :score_completude, :score_unicidade, :score_consistencia, :score_acuracia, :score_atualidade,
                             :score_conformidade_regras,
@@ -435,10 +442,18 @@ class DataMartLoader:
                         "qtd_caracteres_distintos": metrics.get("n_characters_distinct"),
                         "valor_moda": str(metrics["moda"]) if metrics.get("moda") is not None else None,
                         "frequencia_moda": metrics.get("frequencia_moda"),
+                        "frequencia_minima_valor": metrics.get("frequencia_minima_valor"),
+                        "frequencia_mediana_valor": metrics.get("frequencia_mediana_valor"),
                         "percentual_valor_mais_frequente": metrics.get("percentual_valor_mais_frequente"),
                         "indice_concentracao_categorica": metrics.get("indice_concentracao_categorica"),
                         "qtd_datas_invalidas": metrics.get("n_invalid_dates"),
                         "percentual_datas_invalidas": (metrics.get("p_invalid_dates") or None) and metrics.get("p_invalid_dates") * 100,
+                        "distribuicao_dia_semana": (
+                            dumps(metrics.get("distribuicao_dia_semana")) if eh_data and metrics.get("distribuicao_dia_semana") else None
+                        ),
+                        "intervalo_minimo_dias": metrics.get("intervalo_minimo_dias") if eh_data else None,
+                        "intervalo_mediano_dias": metrics.get("intervalo_mediano_dias") if eh_data else None,
+                        "intervalo_maximo_dias": metrics.get("intervalo_maximo_dias") if eh_data else None,
                         "tamanho_memoria_bytes": metrics.get("memory_size"),
                         "score_completude": scores.completude,
                         "score_unicidade": scores.unicidade,
@@ -464,7 +479,7 @@ class DataMartLoader:
                     INSERT INTO fato_perfilamento_base (
                         sk_calendario, sk_execucao, sk_base,
                         qtd_linhas, qtd_colunas, qtd_celulas_nulas, percentual_celulas_nulas,
-                        qtd_colunas_com_nulo, qtd_linhas_duplicadas, percentual_linhas_duplicadas,
+                        qtd_colunas_com_nulo, qtd_colunas_totalmente_nulas, qtd_linhas_duplicadas, percentual_linhas_duplicadas,
                         tamanho_memoria_bytes, tamanho_medio_registro, tipos_coluna, qtd_alertas, alertas,
                         score_final_base, classificacao_final_base,
                         score_final_execucao_anterior, variacao_score_final, percentual_variacao_qtd_linhas,
@@ -472,7 +487,7 @@ class DataMartLoader:
                     ) VALUES (
                         :sk_calendario, :sk_execucao, :sk_base,
                         :qtd_linhas, :qtd_colunas, :qtd_celulas_nulas, :percentual_celulas_nulas,
-                        :qtd_colunas_com_nulo, :qtd_linhas_duplicadas, :percentual_linhas_duplicadas,
+                        :qtd_colunas_com_nulo, :qtd_colunas_totalmente_nulas, :qtd_linhas_duplicadas, :percentual_linhas_duplicadas,
                         :tamanho_memoria_bytes, :tamanho_medio_registro, CAST(:tipos_coluna AS jsonb), :qtd_alertas, CAST(:alertas AS jsonb),
                         :score_final_base, :classificacao_final_base,
                         :score_final_execucao_anterior, :variacao_score_final, :percentual_variacao_qtd_linhas,
@@ -489,13 +504,14 @@ class DataMartLoader:
                     "qtd_celulas_nulas": tabela.get("n_cells_missing"),
                     "percentual_celulas_nulas": (tabela.get("p_cells_missing") or 0) * 100,
                     "qtd_colunas_com_nulo": tabela.get("n_vars_with_missing"),
+                    "qtd_colunas_totalmente_nulas": tabela.get("n_vars_totalmente_nulas"),
                     "qtd_linhas_duplicadas": tabela.get("n_duplicates"),
                     "percentual_linhas_duplicadas": (tabela.get("p_duplicates") or 0) * 100,
                     "tamanho_memoria_bytes": tabela.get("memory_size"),
                     "tamanho_medio_registro": tabela.get("record_size"),
                     "tipos_coluna": dumps(tabela.get("types", {})),
-                    "qtd_alertas": len(full["alertas"]),
-                    "alertas": dumps(full["alertas"]),
+                    "qtd_alertas": len(alertas_automaticos),
+                    "alertas": dumps(alertas_automaticos),
                     "score_final_base": score_final_base,
                     "classificacao_final_base": classificacao_final_base,
                     **historico_base,
@@ -516,9 +532,37 @@ class DataMartLoader:
                     {"exec": sk_execucao, "base": sk_base, "linha": dumps(linha)},
                 )
 
+            # ---- fato satélite: dependências funcionais ----
+            for achado in full.get("dependencias_funcionais") or []:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO fato_dependencia_funcional (
+                            sk_execucao, sk_base, coluna_origem, coluna_destino,
+                            qtd_grupos_origem, percentual_grupos_sem_excecao, qtd_linhas_excecao,
+                            qtd_linhas_avaliadas
+                        ) VALUES (
+                            :exec, :base, :origem, :destino,
+                            :qtd_grupos, :percentual, :qtd_excecao,
+                            :qtd_avaliadas
+                        )
+                        """
+                    ),
+                    {
+                        "exec": sk_execucao,
+                        "base": sk_base,
+                        "origem": achado["origem"],
+                        "destino": achado["destino"],
+                        "qtd_grupos": achado["qtd_grupos_origem"],
+                        "percentual": achado["percentual_grupos_sem_excecao"],
+                        "qtd_excecao": achado["qtd_linhas_excecao"],
+                        "qtd_avaliadas": achado.get("qtd_linhas_avaliadas"),
+                    },
+                )
+
             # ---- alertas automáticos (origem='sistema') ----
             mapa_regra_tipo = self._get_mapa_regra_tipo(conn)
-            for alerta in gerar_alertas_automaticos(full):
+            for alerta in alertas_automaticos:
                 sk_regra_tipo = mapa_regra_tipo.get(alerta["codigo"])
                 if sk_regra_tipo is None:
                     logger.warning(f"Código de regra desconhecido em dim_regra: {alerta['codigo']}")

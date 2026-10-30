@@ -1,104 +1,46 @@
 """
 Mesma orquestração de persistir_datamart.py, mas usando o DuckDBProfiler
-(via extração em lotes Trino/Postgres -> DuckDB local) em vez do ydata-profiling.
-Persiste na MESMA base (mesmo dim_base): dim_execucao guarda qual
-`ferramenta` gerou cada execução, então dá pra comparar lado a lado sem
-misturar os números.
+(via extração em lotes Trino/Postgres -> DuckDB local) em vez do
+ydata-profiling. Persiste na mesma base: dim_execucao guarda qual
+`ferramenta` gerou cada execução, pra comparar lado a lado.
 
-A extração é configurada em DOIS lugares diferentes, de propósito:
+A extração é configurada em dois lugares: FONTE=<nome> (variável de
+ambiente, obrigatória) escolhe qual fonte usar; fontes.ini (ao lado deste
+script) é onde cada fonte mora, uma seção por FONTE com `tipo` (trino,
+postgres, mysql, sqlserver, oracle ou parquet) e os campos de conexão. Um
+arquivo à parte evita que duas fontes do mesmo tipo disputem a mesma
+chave no .env, que guarda só o que é comum a todas as execuções: TABLES e
+PG_DATAMART_* (destino, nunca a fonte).
 
-  - FONTE=<qualquer nome> (variável de ambiente, obrigatória, sem default,
-    .env ou linha de comando) escolhe QUAL fonte usar nesta execução, ex.
-    "postgres_bigdata", "mysql_teste", "oracle_producao". É só um nome.
+MODO "BASE INTEIRA" (TABLES=TODAS, ver `MODO_TODAS_TABELAS`): a lista de
+tabelas é descoberta em tempo de execução via
+`src/extraction/table_discovery.py`, a partir do schema (ou diretório,
+pra parquet) da fonte em uso. Cada tabela é processada isoladamente
+(try/except por tabela): uma falhar não interrompe as demais (resumo
+final em `main()`).
 
-  - fontes.ini (arquivo próprio, ao lado deste script: ver
-    fontes.ini.example) é onde cada fonte de fato mora: uma SEÇÃO por
-    FONTE, contendo o campo `tipo` (trino, postgres, mysql, sqlserver,
-    oracle ou parquet: decide qual conector roda) e os campos de conexão
-    daquela fonte especificamente (host, port, user, password, database/
-    catalog/service_name, schema, ou path pra parquet).
+TIPO=oracle homologado contra Oracle 18c/21c XE via Docker; outras
+versões devem funcionar por compatibilidade de protocolo, mas não
+verificado empiricamente (ver `src/extraction/oracle_to_duckdb.py`).
 
-Por que um arquivo à parte, com seções, em vez de mais variáveis no .env:
-um .env é só uma lista chata de chave=valor, então duas fontes do MESMO
-tipo (ex. dois "postgres") disputariam a MESMA chave (ex.
-PG_SOURCE_HOST): só a última escrita no arquivo sobreviveria, mesmo que
-as duas tivessem seus próprios "FONTE=" por perto. Uma seção do fontes.ini
-isola completamente uma fonte da outra, então os MESMOS nomes de campo
-(host, port, user...) podem se repetir em quantas seções quiser, cada uma
-com seu próprio valor, sem nenhum conflito: permitindo várias fontes do
-mesmo tipo convivendo no mesmo arquivo. O `.env` continua existindo, só
-com o que é comum a todas as execuções: TABLES e PG_DATAMART_* (destino
-dos resultados, nunca confundir com a fonte).
-
-MODO "BASE INTEIRA" (perfilar TODAS as tabelas de um schema/diretório, sem
-listar uma por uma): defina TABLES=TODAS (env ou argv, mesmo lugar de sempre). É uma
-sentinela case-insensitive (ver `MODO_TODAS_TABELAS` abaixo). Quando
-ativado, a lista de tabelas não vem mais de TABLES, e sim é DESCOBERTA em
-tempo de execução via `src/extraction/table_discovery.py`, usando o schema
-(ou diretório, pra parquet) configurado na seção da FONTE em uso dentro de
-fontes.ini:
-  - Postgres/MySQL/SQL Server: `information_schema.tables` do schema.
-  - Oracle: `ALL_TABLES` do owner (uppercased antes de comparar: ver
-    docstring de `listar_tabelas_oracle`).
-  - Trino: `information_schema.tables` do schema: por analogia, não
-    validado ponta a ponta contra Trino real (ver docstring de
-    `listar_tabelas_trino`).
-  - Parquet: enumera arquivos `.parquet` diretamente dentro do diretório
-    (não recursivo: ver docstring de `listar_arquivos_parquet`); cada
-    arquivo é uma tabela distinta.
-Cada tabela descoberta é processada isoladamente (try/except por tabela): uma
-tabela falhar (permissão, tipo exótico, tabela sem colunas etc.) fica
-registrada no log e NÃO interrompe as demais: resumo final impresso ao fim
-do loop com quantas tiveram sucesso/falha (ver `main()`).
-
-TIPO=oracle: faixa homologada: testado de ponta a ponta (extração +
-profiling + persistência no data mart real) contra Oracle 18c XE e 21c XE
-via Docker (`gvenzl/oracle-xe:18-slim` e `:21-slim`). "Deveria funcionar"
-também em outras versões (12c+/19c/23c) por compatibilidade de protocolo
-(mesmo driver `python-oracledb` em modo thin), mas isso NÃO foi verificado
-empiricamente: só as duas versões citadas acima foram de fato rodadas. Ver
-`src/extraction/oracle_to_duckdb.py` pras particularidades de tipo (NUMBER
-sem INTEGER/DECIMAL separados, DATE com componente de hora, CLOB/BLOB).
-
-TIPO=parquet é diferente das outras três: não tem conexão de banco nenhuma
-(sem cursor, sem credenciais): só um caminho de arquivo/diretório local,
-configurado no campo `path` da seção da fonte em fontes.ini. Por isso não
-existe uma `origem_conn` de verdade pra essa fonte (ver `origem_conn = None`
-no switch abaixo, e o `if origem_conn:` antes do `.close()` no fim do
-arquivo).
-
-TIPO=parquet com o campo `path` apontando pra um DIRETÓRIO tem DOIS
-comportamentos totalmente diferentes, que dependem só de TABLES=TODAS estar
-ou não definido: fácil de confundir os dois, leia com atenção:
-  - Modo TABELA ÚNICA (padrão, sem TABLES=TODAS): o diretório é tratado como
-    UMA base unificada: todos os `.parquet` soltos diretamente dentro dele
-    (não recursivo, pra não colidir com particionamento Hive em subpastas)
-    são mesclados numa ÚNICA tabela/execução, com o total de linhas somado.
-    Detecção automática em `_resolver_caminho_parquet_unico`: monta o glob
-    "<diretorio>/*.parquet" sozinho, sem o usuário precisar digitar glob
-    nenhum: motivado por data lakes reais serem, com frequência, N arquivos
-    parquet de mesmo schema numa pasta (exportações em lote).
-  - Modo BASE INTEIRA (TABLES=TODAS, ver abaixo): o MESMO diretório vira um
-    catálogo de tabelas DISTINTAS: cada `.parquet` dentro dele é UMA tabela
-    separada, com perfilamento/execução própria (via `listar_arquivos_parquet`).
-Ou seja: mesmo diretório, resultado oposto (1 base vs. N tabelas), decidido
-inteiramente por TABLES=TODAS estar presente ou não.
+TIPO=parquet não tem conexão de banco, só um caminho em `path`. Um
+diretório em `path` se comporta diferente conforme TABLES=TODAS: sem
+ele, todos os `.parquet` da pasta mesclam numa única base
+(`_resolver_caminho_parquet_unico` monta o glob sozinho); com ele, cada
+`.parquet` vira uma tabela distinta (`listar_arquivos_parquet`).
 
 Uso: FONTE=<nome> .venv/bin/python persistir_datamart_duckdb.py [tabela1,tabela2,...]
-FONTE é sempre obrigatória (.env ou linha de comando, sem valor padrão) e
-precisa ter uma seção [<nome>] correspondente em fontes.ini. Sem o
-argumento de tabelas, roda pra todas as tabelas listadas em TABLES (.env ou
-linha de comando) ou, na ausência disso, no campo "tables" da seção da
-FONTE em fontes.ini. Se nem isso existir (TIPO != parquet, que deriva a
-tabela do próprio `path`), cai automaticamente no modo "base inteira"
-(TABLES=TODAS): uma fonte sem `tables` configurado é tratada como "perfila
-tudo", nunca como erro de configuração.
+FONTE é sempre obrigatória, com seção [<nome>] em fontes.ini. Sem
+argumento de tabelas, roda as de TABLES (.env/linha de comando) ou do
+campo "tables" da fonte em fontes.ini; se nenhum existir, cai no modo
+"base inteira" (perfila tudo, não é erro de configuração).
 """
 
 import configparser
 import os
 import sys
 import time
+from datetime import datetime
 
 import duckdb
 import oracledb
@@ -108,6 +50,10 @@ import pymssql
 import trino
 from dotenv import load_dotenv
 from loguru import logger
+
+# Precisa rodar antes de qualquer import de src/: duckdb_profiler.py lê os
+# tetos DQP_TETO_* do ambiente na importação, como constante de módulo.
+load_dotenv()
 
 sys.path.insert(0, "src")
 
@@ -130,19 +76,13 @@ from profilers.duckdb_profiler import DuckDBProfiler
 from quality.quality_scorer import QualityScorer
 from rules.user_rules_engine import avaliar_regras
 
-load_dotenv()
-
 CAMINHO_FONTES_INI = "fontes.ini"
 
 
 def _carregar_secao_fonte(fonte: str) -> dict:
     """Lê a seção [<fonte>] de fontes.ini. Cada fonte mora na sua própria
-    seção, usando sempre os MESMOS nomes de campo (host, port, user,
-    password, database/catalog/service_name, schema, path) não importa o
-    tipo: é a seção em si que isola uma fonte da outra, então duas fontes
-    do mesmo tipo (ex. duas seções "mysql_teste" e "mysql") convivem no
-    mesmo arquivo sem nenhum conflito, cada uma com seus próprios valores.
-    Ver docstring do módulo pro motivo de não usar só o .env pra isso."""
+    seção (host, port, user, password, database/catalog/service_name,
+    schema, path), o que isola fontes do mesmo tipo sem conflito de nomes."""
     if not os.path.exists(CAMINHO_FONTES_INI):
         raise ValueError(
             f"Arquivo '{CAMINHO_FONTES_INI}' não encontrado: copie "
@@ -173,6 +113,31 @@ if not os.environ.get("FONTE"):
     )
 FONTE = os.environ["FONTE"].strip()
 
+# Grava um log por execução em logs/, além do terminal: cobre tanto as
+# linhas do loguru quanto os print() soltos (via Tee do stdout).
+os.makedirs("logs", exist_ok=True)
+_timestamp_log = datetime.now().strftime("%Y%m%d_%H%M%S")
+_caminho_log = f"logs/persistir_datamart_duckdb_{FONTE}_{_timestamp_log}.log"
+logger.add(_caminho_log, level="DEBUG", encoding="utf-8")
+
+
+class _TeeStdout:
+    def __init__(self, destino_original, caminho_arquivo):
+        self._original = destino_original
+        self._arquivo = open(caminho_arquivo, "a", encoding="utf-8")
+
+    def write(self, texto):
+        self._original.write(texto)
+        self._arquivo.write(texto)
+        return len(texto)
+
+    def flush(self):
+        self._original.flush()
+        self._arquivo.flush()
+
+
+sys.stdout = _TeeStdout(sys.stdout, _caminho_log)
+
 # A seção em si (host, port, user, password, ... conforme o tipo) e o TIPO
 # (trino/postgres/mysql/sqlserver/oracle/parquet) vêm de dentro dela: ver
 # `_carregar_secao_fonte` acima.
@@ -181,34 +146,19 @@ TIPO = SECAO_FONTE["tipo"].strip().lower()
 
 
 def _segmento_diretorio_significativo(caminho: str) -> str:
-    """
-    Segmento de diretório "significativo" mais próximo de `caminho`
-    (arquivo ou glob): olha só pro DIRETÓRIO que contém `caminho` (ignora o
-    nome do arquivo/glob final) e caminha os segmentos da direita pra
-    esquerda até achar um que não seja glob (`*`, `?`, `[`) nem partição
-    Hive (`chave=valor`, ex. "ano=2024"): ex. "/dados/*.parquet" -> "dados";
-    "/dados/particionado/ano=2024/*.parquet" -> "particionado". Usado tanto
-    pra `catalogo_origem` (identifica de onde o dataset veio no filesystem)
-    quanto, quando o nome do arquivo também é glob, como base do nome de
-    tabela padrão (ver `_nome_tabela_padrao_parquet`).
-    """
+    """Segmento de diretório "significativo" mais próximo de `caminho`:
+    caminha da direita pra esquerda até achar um que não seja glob nem
+    partição Hive. Ex: "/dados/ano=2024/*.parquet" -> "dados". Usado em
+    `catalogo_origem` e em `_nome_tabela_padrao_parquet`."""
     diretorio = os.path.dirname(caminho.rstrip("/"))
     partes = [p for p in diretorio.split("/") if p and not any(c in p for c in "*?[") and "=" not in p]
     return partes[-1] if partes else (diretorio or caminho)
 
 
 def _nome_tabela_padrao_parquet(caminho: str) -> str:
-    """
-    Deriva um nome de tabela a partir do campo `path` (fontes.ini) quando TABLES
-    não foi especificado explicitamente (nem via argv, nem via .env),
-    parquet não tem um catálogo de tabelas pra listar, então sem TABLES só
-    sobra o próprio caminho pra nomear a única "tabela" que essa execução
-    processa. Regra: nome do arquivo sem extensão (ex.
-    "/dados/vendas.parquet" -> "vendas"). Quando o caminho é um glob sem
-    nome de arquivo fixo (ex. "/dados/*.parquet" ou
-    "/dados/ano=2024/*.parquet", o caso particionado), usa
-    `_segmento_diretorio_significativo` (ex. "/dados/*.parquet" -> "dados").
-    """
+    """Deriva um nome de tabela a partir de `path` quando TABLES não foi
+    especificado: nome do arquivo sem extensão, ou, se `path` é um glob
+    sem nome fixo, `_segmento_diretorio_significativo`."""
     caminho = caminho.rstrip("/")
     base = os.path.basename(caminho)
     if not base or any(c in base for c in "*?["):
@@ -219,45 +169,20 @@ def _nome_tabela_padrao_parquet(caminho: str) -> str:
 
 def _resolver_caminho_parquet_unico(caminho: str) -> str:
     """
-    Resolve o campo `path` (fontes.ini) pro caminho/glob final passado pra
+    Resolve `path` (fontes.ini) pro caminho/glob final passado pra
     `extrair_para_duckdb_parquet` no modo TABELA ÚNICA (fora de
-    TABLES=TODAS: esse modo tem sua própria descoberta multi-tabela em
-    `listar_arquivos_parquet`, não tocada por esta função). Três casos:
+    TABLES=TODAS). Três casos: arquivo específico devolve como está; glob
+    explícito (`*`, `?`, `[`) devolve como está; diretório comum sem glob
+    monta automaticamente "<diretorio>/*.parquet" (não recursivo, pra não
+    colidir com particionamento Hive), pensado pra data lakes com vários
+    parquet soltos numa pasta.
 
-      1. Já é um arquivo `.parquet` específico (ex. "/dados/vendas.parquet"):
-         devolve como está: comportamento de sempre, sem mudança.
-      2. Já contém caractere de glob (`*`, `?`, `[`), ex. "/dados/*.parquet"
-         ou "/dados/ano=2024/*.parquet" (particionamento Hive): devolve como
-         está: o usuário já escreveu o glob manualmente, sabe o que está
-         fazendo, não há nada a detectar.
-      3. É um DIRETÓRIO comum existente, sem glob nenhum (ex. "/dados"):
-         monta automaticamente o glob não recursivo "/dados/*.parquet",
-         MESMA regra "não desce em subpastas" de `listar_arquivos_parquet`
-         (evita colidir com particionamento Hive em subpastas, ex.
-         "/dados/ano=2024/"). Motivação (pedido explícito do usuário):
-         tantos data lakes reais são formados por N arquivos parquet de
-         mesmo schema soltos numa pasta (múltiplas exportações em lote, sem
-         necessariamente seguir convenção Hive): nesse caso o usuário só
-         quer apontar pra pasta e perfilar tudo como SE FOSSE uma tabela só,
-         sem precisar saber de antemão que precisaria digitar "/*.parquet"
-         no final. Quem já quer esse resultado hoje escrevendo o glob à mão
-         continua podendo (caso 2 acima é idêntico ao resultado deste caso).
+    A mesclagem em si é feita pelo DuckDB em `read_parquet`; esta função só
+    decide qual caminho/glob passar.
 
-    A mesclagem de fato continua sendo feita pelo DuckDB nativamente dentro
-    de `read_parquet` (ver `extrair_para_duckdb_parquet`): esta função só
-    decide QUE caminho/glob passar pra ele; não abre, lê nem valida arquivo
-    nenhum. Se os arquivos dentro do diretório tiverem schema incompatível
-    entre si, o erro do DuckDB continua propagando normalmente (mesma
-    filosofia de sempre: sem union_by_name/CAST forçado pra "salvar" schema
-    divergente).
-
-    IMPORTANTE: não confundir com TABLES=TODAS: aqui (modo tabela única) um
-    diretório vira UMA base unificada (N arquivos -> 1 tabela, linhas
-    somadas). Em TABLES=TODAS, o MESMO diretório é tratado como catálogo de
-    tabelas DISTINTAS (N arquivos -> N tabelas, perfilamentos separados),
-    ver `listar_arquivos_parquet` e o bloco `if TIPO == "parquet" and
-    MODO_TODAS_TABELAS` em `main()`. É fácil confundir os dois: a distinção
-    inteira está em TABLES=TODAS estar ou não definido, não no caminho em si.
+    Não confundir com TABLES=TODAS: aqui um diretório vira uma base
+    unificada (N arquivos -> 1 tabela); em TABLES=TODAS, o mesmo diretório
+    vira um catálogo de tabelas distintas (ver `listar_arquivos_parquet`).
     """
     caminho_sem_barra = caminho.rstrip("/")
     if any(c in caminho for c in "*?["):
@@ -268,22 +193,10 @@ def _resolver_caminho_parquet_unico(caminho: str) -> str:
 
 
 # Lista de tabelas, em ordem de prioridade: argumento de linha de comando
-# (tabela1,tabela2,...) > TABLES do .env/linha de comando (sobrescreve
-# pontualmente, pra uma execução avulsa, sem mexer em arquivo nenhum) >
-# campo "tables" da seção da FONTE em fontes.ini (o padrão de cada fonte,
-# já que bases diferentes normalmente têm tabelas diferentes: por isso
-# TABLES não mora no .env, que é compartilhado por todas as fontes).
-# Sempre tabela inteira, sem amostragem: o DuckDB não tem o teto de RAM que
-# o pandas/ydata tinham, testado com tabelas completas de 300k+ linhas.
-#
-# TIPO=parquet é o único caso em que tudo isso pode ficar ausente: sem
-# conexão de banco nenhuma pra listar tabelas, o campo `path` já é o único
-# arquivo/glob processado nessa execução, então o nome da tabela é derivado
-# dele (ver `_nome_tabela_padrao_parquet`) quando não há TABLES em lugar
-# nenhum. Pra qualquer outro tipo, a ausência total de TABLES (argv, .env e
-# fontes.ini) cai no modo "base inteira" (TABLES=TODAS) por padrão, em vez de
-# erro: uma fonte sem `tables` preenchido é tratada como "perfila tudo que
-# encontrar", não como configuração inválida.
+# > TABLES do .env/linha de comando > campo "tables" da fonte em
+# fontes.ini. TIPO=parquet sem nenhum dos três deriva o nome de `path`
+# (`_nome_tabela_padrao_parquet`); qualquer outro tipo cai no modo "base
+# inteira" (TABLES=TODAS) por padrão, não como erro de configuração.
 if len(sys.argv) > 1:
     fonte_tabelas = sys.argv[1]
 elif os.environ.get("TABLES"):
@@ -300,15 +213,9 @@ else:
         "todas as tabelas encontradas no schema/diretório configurado."
     )
 
-# Sentinela do modo "base inteira" (item 3 do backlog): TABLES=TODAS (ou
-# argv[1]="TODAS", case-insensitive) pula a lista explícita e descobre TODAS
-# as tabelas do schema/diretório configurado pra fonte em uso, em tempo de
-# execução dentro de main() (só ali existe conexão/caminho já resolvido pra
-# listar): ver `table_discovery.py` e o bloco "MODO BASE INTEIRA" no
-# docstring do módulo. "TODAS" (não "*" ou "ALL") pra ficar no mesmo idioma
-# do resto da ferramenta (nomes de coluna, mensagens, etc. já são em
-# português) e evitar colisão com glob de shell (`*` sem aspas se expande
-# antes mesmo de chegar no Python, se alguém esquecer de citar o argumento).
+# TABLES=TODAS (case-insensitive) pula a lista explícita e descobre todas
+# as tabelas da fonte em main() (ver `table_discovery.py`). "TODAS" em vez
+# de "*" pra evitar colisão com glob de shell sem aspas.
 MODO_TODAS_TABELAS = fonte_tabelas.strip().upper() == "TODAS"
 
 if MODO_TODAS_TABELAS:
@@ -358,11 +265,9 @@ def get_mysql_source_connection(secao):
 
 
 def get_sqlserver_source_connection(secao):
-    """Conexão com o SQL Server FONTE (dados a perfilar): campos lidos da
-    seção da fonte em fontes.ini, distinto do Postgres do data mart
-    (PG_DATAMART_*, no .env, destino). Usa pymssql (não pyodbc: ver
-    docstring de extraction/sqlserver_to_duckdb.py pra motivo da escolha de
-    driver)."""
+    """Conexão com o SQL Server FONTE (dados a perfilar, distinto do
+    Postgres do data mart). Usa pymssql, não pyodbc (ver docstring de
+    extraction/sqlserver_to_duckdb.py)."""
     return pymssql.connect(
         server=secao["host"],
         port=int(secao["port"]),
@@ -373,16 +278,11 @@ def get_sqlserver_source_connection(secao):
 
 
 def get_oracle_source_connection(secao):
-    """Conexão com o Oracle FONTE (dados a perfilar): campos lidos da seção
-    da fonte em fontes.ini, distinto do Postgres do data mart (PG_DATAMART_*,
-    no .env, destino). Usa python-oracledb em modo thin (default do driver,
-    sem `oracledb.init_oracle_client()`): não exige Oracle Instant Client
-    instalado no sistema, confirmado empiricamente contra Oracle 18c/21c XE
-    (ver docstring de extraction/oracle_to_duckdb.py). `dsn` monta o
-    `host:port/service_name` esperado pelo driver: Oracle usa "service
-    name" (ou SID, legado) em vez do "database" simples do Postgres/MySQL;
-    a imagem `gvenzl/oracle-xe` usada na validação expõe o pluggable
-    database como `XEPDB1` por padrão."""
+    """Conexão com o Oracle FONTE (dados a perfilar, distinto do Postgres
+    do data mart). Usa python-oracledb em modo thin, sem exigir Oracle
+    Instant Client instalado (ver extraction/oracle_to_duckdb.py). `dsn`
+    monta `host:port/service_name`, já que Oracle usa "service name" em
+    vez do "database" simples do Postgres/MySQL."""
     dsn = f"{secao['host']}:{secao['port']}/{secao['service_name']}"
     return oracledb.connect(
         user=secao["user"],
@@ -401,7 +301,7 @@ def datamart_connection_string() -> str:
 def main():
     global TABLES  # reatribuído abaixo quando MODO_TODAS_TABELAS descobre a lista em tempo de execução
 
-    # Conector de extração: TIPO decide a conexão e o bloco de variáveis lido;
+    # Conector de extração: TIPO decide a conexão e o bloco de variáveis lido.
     # FONTE (rótulo livre) vira sistema_origem, identificando esta fonte
     # especificamente no data mart: ver docstring do módulo.
     if TIPO == "postgres":
@@ -430,22 +330,11 @@ def main():
         catalogo_origem = SECAO_FONTE["catalog"]
         schema_origem = SECAO_FONTE["schema"]
     elif TIPO == "parquet":
-        # Sem conexão de banco nenhuma pra essa fonte: só um arquivo/glob
-        # local (ver docstring do módulo). `catalogo_origem`/`schema_origem`
-        # não têm um equivalente natural pra parquet (não existe "banco" nem
-        # "schema" num arquivo solto), então usamos o segmento de diretório
-        # "significativo" mais próximo do arquivo/glob (ver
-        # `_segmento_diretorio_significativo`: pula segmentos glob tipo
-        # "*" e partições Hive tipo "ano=2024", pra não gravar algo inútil
-        # como catalogo="*" quando o campo `path` é um glob particionado)
-        # como `catalogo_origem`. Identifica de onde o dataset veio no
-        # filesystem, análogo ao papel do catálogo/database nas outras
-        # fontes, mas curto: testado: o caminho absoluto inteiro estourou
-        # `dim_base.catalogo`, que é `VARCHAR(100)` no data mart (caminhos de
-        # diretório temporário/scratch passam de 100 caracteres fácil;
-        # um único segmento de diretório não). `schema_origem` fica vazio:
-        # não há um segundo nível de namespace pra representar. Truncado em
-        # 100 chars como cinto de segurança pro mesmo limite.
+        # Parquet não tem conexão nem "banco"/"schema" próprios, então
+        # `catalogo_origem` usa o segmento de diretório significativo mais
+        # próximo (`_segmento_diretorio_significativo`), truncado em 100
+        # chars pro limite de `dim_base.catalogo` (VARCHAR(100)).
+        # `schema_origem` fica vazio: não há namespace a representar.
         origem_conn = None
         sistema_origem = FONTE
         caminho_parquet_origem = SECAO_FONTE["path"]
@@ -496,21 +385,11 @@ def main():
 
     for table_name, limite in TABLES.items():
         print(f"\n{'=' * 80}\nTABELA: {table_name} (via DuckDB, fonte={FONTE}, tipo={TIPO})\n{'=' * 80}")
-        # No modo "base inteira" (TABLES=TODAS) com TIPO=parquet,
-        # caminho_parquet_origem é o DIRETÓRIO inteiro (ver listar_arquivos_parquet)
-        #: cada tabela descoberta precisa apontar pro SEU PRÓPRIO arquivo
-        # dentro dele, senão `read_parquet` acaba lendo o diretório inteiro
-        # de novo a cada iteração (bug real encontrado na validação desta
-        # tarefa: as 3 "tabelas" liam o glob do diretório inteiro e
-        # colidiam por schema incompatível entre arquivos). Fora do modo
-        # TODAS (modo tabela única), caminho_parquet_origem pode ser um
-        # arquivo específico, um glob já escrito à mão, OU um diretório
-        # comum: nesse último caso `_resolver_caminho_parquet_unico`
-        # detecta e monta o glob não recursivo automaticamente, tratando
-        # todos os .parquet soltos na pasta como UMA base só (ver docstring
-        # da função: NÃO confundir com o modo TODAS logo acima: mesmo
-        # diretório, comportamento oposto, dependendo só de TABLES=TODAS
-        # estar ou não definido).
+        # Em TABLES=TODAS com parquet, caminho_parquet_origem é o diretório
+        # inteiro: cada tabela precisa apontar pro seu próprio arquivo,
+        # senão `read_parquet` relê o diretório inteiro a cada iteração.
+        # Fora desse modo, `_resolver_caminho_parquet_unico` já resolveu o
+        # caminho (arquivo, glob ou diretório mesclado numa base só).
         if TIPO == "parquet" and MODO_TODAS_TABELAS:
             caminho_parquet_tabela = os.path.join(caminho_parquet_origem, f"{table_name}.parquet")
         elif TIPO == "parquet":
@@ -533,17 +412,9 @@ def main():
             logger.exception(f"Falha ao processar a tabela '{table_name}': seguindo pras próximas.")
             tabelas_falhas.append((table_name, f"{type(exc).__name__}: {exc}"))
             if origem_conn is not None:
-                # `origem_conn` é REUTILIZADA pra todas as tabelas do loop,
-                # se a falha veio de dentro de uma query no meio de uma
-                # transação (ex. erro de permissão/tipo no meio do SELECT do
-                # Postgres), a conexão pode ficar numa transação "abortada"
-                # que rejeitaria qualquer comando seguinte até um ROLLBACK
-                # explícito. Nem todo driver expõe rollback() com o mesmo
-                # comportamento (psycopg2 sim; pymysql/pymssql/oracledb
-                # tratam como no-op fora de transação; trino.dbapi pode nem
-                # ter o método): daí o try/except amplo aqui, é só uma
-                # rede de segurança pra não deixar UMA tabela ruim
-                # contaminar a conexão compartilhada pras próximas.
+                # `origem_conn` é reutilizada entre tabelas: uma falha pode
+                # deixá-la numa transação abortada, daí o rollback de
+                # segurança pra não contaminar as próximas tabelas do loop.
                 try:
                     origem_conn.rollback()
                 except Exception:

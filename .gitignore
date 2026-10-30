@@ -9,3 +9,8 @@ fontes.ini
 # repo, o conteúdo não. Roda gerar_relatorios_pt.py pra preencher local.
 relatorios/*
 !relatorios/.gitkeep
+
+# Logs de execução (gerados em disco a cada run): a pasta fica no repo, o
+# conteúdo não.
+logs/*
+!logs/.gitkeep

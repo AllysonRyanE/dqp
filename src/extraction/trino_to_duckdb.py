@@ -5,7 +5,7 @@ resultado inteiro na memória de uma vez.
 As colunas do DuckDB usam o tipo nativo informado pelo Trino
 (`cursor.description`), não VARCHAR genérico: melhora a compressão. Tipo
 sem mapeamento conhecido cai em VARCHAR. Mapeamento feito por analogia ao
-de Postgres/MySQL; não validado contra um Trino real (sem acesso de rede
+de Postgres/MySQL, não validado contra um Trino real (sem acesso de rede
 ao BigDataPE nesta sandbox).
 
 Cada lote vira um DataFrame pandas pequeno, inserido via

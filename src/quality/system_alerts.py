@@ -21,10 +21,8 @@ LIMIAR_PERCENTUAL_ZEROS = 50.0
 LIMIAR_PERCENTUAL_NEGATIVOS = 5.0
 LIMIAR_PARSE_TIPO_FISICO_DIVERGENTE = 90.0  # mesmo limiar que o profiler usa pra classificar a coluna como Numeric/DateTime
 
-# Separa, dentro do mesmo campo `mensagem` (sem mudar o schema do data mart),
-# a evidência técnica (o número medido) da interpretação em linguagem simples
-#: relatorio_pt.py usa esse mesmo separador pra renderizar as duas partes em
-# colunas distintas na tabela detalhada.
+# Separa, dentro do campo `mensagem`, a evidência técnica da interpretação
+# em linguagem simples. relatorio_pt.py usa pra renderizar em colunas distintas.
 SEPARADOR_EVIDENCIA_CONCLUSAO = " ||| "
 
 
@@ -187,7 +185,8 @@ def gerar_alertas_automaticos(full: Dict[str, Any]) -> List[Dict[str, Any]]:
         qtd_linhas = metrics.get("qtd_linhas_total") or 0
         seletividade = metrics.get("seletividade")
         if (
-            seletividade is not None
+            tipo != "Identifier"  # já é um tipo explícito pra isso, o alerta aqui seria redundante
+            and seletividade is not None
             and seletividade > LIMIAR_CARDINALIDADE_ALTA
             and qtd_linhas >= QTD_MINIMA_LINHAS_PARA_CARDINALIDADE
         ):
@@ -221,5 +220,24 @@ def gerar_alertas_automaticos(full: Dict[str, Any]) -> List[Dict[str, Any]]:
                         {"metodo": metodo_legivel, "valor_correlacao": valor, "limiar": LIMIAR_CORRELACAO_ALTA},
                         colunas_envolvidas=f"{coluna_a},{coluna_b}",
                     ))
+
+    # Uma FD "quase sempre" válida ainda pode esconder exceções que valem
+    # investigar. Só gera alerta/métrica aqui, não entra no score de qualidade.
+    for achado in full.get("dependencias_funcionais") or []:
+        qtd_excecao = achado.get("qtd_linhas_excecao") or 0
+        if qtd_excecao <= 0:
+            continue
+        alertas.append(_alerta(
+            "dependencia_funcional_com_excecoes", None,
+            f"'{achado['origem']}' determina '{achado['destino']}' em {achado['percentual_grupos_sem_excecao']:.1f}% "
+            f"dos grupos, mas {qtd_excecao} linha(s) quebram essa regra.",
+            "Pode ser uma regra de negócio com exceções legítimas (casos especiais) ou indicar erro de "
+            "cadastro nas linhas que não seguem o padrão; vale checar as linhas de exceção específicas.",
+            {
+                "percentual_grupos_sem_excecao": achado["percentual_grupos_sem_excecao"],
+                "qtd_linhas_excecao": qtd_excecao,
+            },
+            colunas_envolvidas=f"{achado['origem']},{achado['destino']}",
+        ))
 
     return alertas

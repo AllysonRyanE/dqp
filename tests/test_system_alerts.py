@@ -99,3 +99,25 @@ def test_mensagem_separa_evidencia_e_conclusao():
     })
     alerta = gerar_alertas_automaticos(full)[0]
     assert SEPARADOR_EVIDENCIA_CONCLUSAO in alerta["mensagem"]
+
+
+def test_dependencia_funcional_com_excecao_gera_alerta():
+    full = _full({})
+    full["dependencias_funcionais"] = [
+        {"origem": "produto", "destino": "unidade", "qtd_grupos_origem": 10,
+         "percentual_grupos_sem_excecao": 97.0, "qtd_linhas_excecao": 3, "qtd_linhas_avaliadas": 500},
+    ]
+    alertas = gerar_alertas_automaticos(full)
+    assert "dependencia_funcional_com_excecoes" in _codigos(alertas)
+
+
+def test_dependencia_funcional_sem_excecao_nao_gera_alerta():
+    """100% de aderência (0 exceções) é o caso comum e esperado: não é achado
+    que precise de alerta, só o caso com exceção de verdade é que vale a pena."""
+    full = _full({})
+    full["dependencias_funcionais"] = [
+        {"origem": "produto", "destino": "loja", "qtd_grupos_origem": 4,
+         "percentual_grupos_sem_excecao": 100.0, "qtd_linhas_excecao": 0, "qtd_linhas_avaliadas": 100},
+    ]
+    alertas = gerar_alertas_automaticos(full)
+    assert "dependencia_funcional_com_excecoes" not in _codigos(alertas)

@@ -73,7 +73,7 @@ Uma coluna dentro de uma base. Chave natural = `(sk_base, nome_coluna)`: **se a 
 ### Tipagem
 | Coluna | Significado |
 |---|---|
-| `tipo_dado_inferido` | Tipo que o ydata-profiling inferiu: `Numeric`, `Text`, `Categorical`, `DateTime`, `Boolean`, `Unsupported` |
+| `tipo_dado_inferido` | `Numeric`, `Identifier` (subtipo do Numeric com formato de código, ex: CPF/matrícula — fica fora das estatísticas numéricas), `Text`, `Categorical`, `DateTime`, `Time` (coluna cuja data é sempre um valor sentinela constante, ex: `1970-01-01` — só a hora varia de verdade, sem dia da semana/intervalo), `Unsupported` |
 | `percentual_valores_parseaveis_numero` | Só calculado se `tipo_dado_inferido` é `Text`/`Categorical`: % de valores que, mesmo vindo como texto, parseiam como número (`pd.to_numeric`). `NULL` se a coluna é quase-única (>90% valores distintos: guarda contra um segfault real do pandas em colunas tipo hash/ID; testamos e o gatilho é cardinalidade, não comprimento de string, ver bugs no runbook) |
 | `percentual_valores_parseaveis_data` | Idem, mas testando `pd.to_datetime` |
 
@@ -96,6 +96,8 @@ Uma coluna dentro de uma base. Chave natural = `(sk_base, nome_coluna)`: **se a 
 |---|---|
 | `data_minima`, `data_maxima` | Min/max (equivalente a `valor_minimo`/`valor_maximo`, mas em `TIMESTAMP`: colunas separadas porque não dá pra misturar tipo com `NUMERIC`) |
 | `qtd_datas_invalidas`, `percentual_datas_invalidas` | Valores que não conformam ao formato de data esperado: é a base do score de consistência pra colunas de data |
+| `distribuicao_dia_semana` | JSONB tipo `{"Segunda-feira": 120, "Terça-feira": 98, ...}` (chaves em português, ordenadas de segunda a domingo): contagem de linhas por dia da semana. Uma concentração forte num único dia pode ser regra de negócio legítima ou falha de carga. `NULL`/vazio em colunas do tipo `Time` (a data é sentinela, não faz sentido medir dia da semana) |
+| `intervalo_minimo_dias`, `intervalo_mediano_dias`, `intervalo_maximo_dias` | Intervalo em dias entre datas **distintas** consecutivas (ordenadas), não entre linhas: custo independe do total de linhas. Um intervalo máximo muito maior que o mediano sinaliza uma lacuna isolada no período coberto |
 
 ### Outliers (só preenchido quando `tipo_dado_inferido = 'Numeric'`)
 | Coluna | Significado |
@@ -114,6 +116,8 @@ Uma coluna dentro de uma base. Chave natural = `(sk_base, nome_coluna)`: **se a 
 |---|---|
 | `valor_moda` | Valor mais frequente (sempre armazenado como texto, `str()`) |
 | `frequencia_moda` | Quantas vezes o valor mais frequente aparece |
+| `frequencia_minima_valor` | A menor frequência entre os valores distintos da coluna: complementa `frequencia_moda` pra diferenciar "maioria aparece 1x" de "tudo se repete parecido" |
+| `frequencia_mediana_valor` | Mediana das frequências por valor distinto (só com `frequencia_moda`, uma moda alta isolada não distingue esses dois cenários) |
 | `percentual_valor_mais_frequente` | `frequencia_moda / total_nao_nulo × 100` |
 | `indice_concentracao_categorica` | Índice de Herfindahl (soma das proporções ao quadrado): 0 = disperso, 1 = uma categoria domina tudo |
 
@@ -160,10 +164,11 @@ Uma coluna dentro de uma base. Chave natural = `(sk_base, nome_coluna)`: **se a 
 | `qtd_linhas`, `qtd_colunas` | Tamanho da tabela nessa execução |
 | `qtd_celulas_nulas`, `percentual_celulas_nulas` | Nulos agregados de todas as colunas |
 | `qtd_colunas_com_nulo` | Quantas colunas têm pelo menos 1 nulo |
+| `qtd_colunas_totalmente_nulas` | Quantas colunas são 100% nulas (comum em exportação SAP): não geram alerta nenhum por coluna, essa contagem agregada é o jeito de perceber isso sem abrir coluna por coluna |
 | `qtd_linhas_duplicadas`, `percentual_linhas_duplicadas` | Linha **inteira** duplicada (diferente de `qtd_valores_repetidos` por coluna) |
 | `tamanho_memoria_bytes`, `tamanho_medio_registro` | Memória total / por registro |
 | `tipos_coluna` | JSONB tipo `{"Text": 30, "Numeric": 5}`: contagem de colunas por tipo inferido |
-| `qtd_alertas`, `alertas` | Quantidade e lista (JSONB) dos alertas que o ydata-profiling gerou |
+| `qtd_alertas`, `alertas` | Quantidade e lista (JSONB) dos alertas automáticos (`gerar_alertas_automaticos()`, origem `'sistema'` em `fato_regra_aplicada`) |
 | `score_final_base` | `0,85 × média(score_geral das colunas) + 0,15 × (100 − percentual_linhas_duplicadas)` |
 | `classificacao_final_base` | Crítico/Regular/Ótimo do `score_final_base` |
 | `score_final_execucao_anterior`, `variacao_score_final`, `percentual_variacao_qtd_linhas`, `dias_desde_execucao_anterior`, `qtd_execucoes_anteriores` | Histórico (grupo 2), mesma lógica da fato de coluna mas no nível da base |
@@ -176,7 +181,20 @@ Uma coluna dentro de uma base. Chave natural = `(sk_base, nome_coluna)`: **se a 
 Grão: par de colunas × execução × método. `coluna_a`/`coluna_b` (nomes), `metodo` (ex: `'auto'`), `valor_correlacao`. Só o triângulo superior da matriz é gravado (sem diagonal, sem repetir o par invertido).
 
 ### `fato_padrao_ausencia`
-Grão: par de colunas × execução. `correlacao_nulidade`: o quanto a ausência de uma coluna coincide com a ausência de outra (`df.isna().corr()`). Só existe pra colunas que de fato têm algum nulo.
+Grão: par de colunas × execução. `correlacao_nulidade`: o quanto a ausência de uma coluna coincide com a ausência de outra. Só entram colunas com nulo **parcial** (nem 0% nem 100% nula): uma coluna 100% nula tem indicador de nulo constante, e `CORR()` de uma constante é indefinido (NaN), não "correlação forte" — por isso fica de fora da matriz.
+
+### `fato_dependencia_funcional`
+Grão: par origem→destino × execução. Descoberta automática pelo `DuckDBProfiler` (não é regra declarada pelo usuário, essa fica em `config_regra_usuario`/`fato_regra_aplicada`). Diferente de `fato_correlacao`, é **direcional**: `coluna_origem`/`coluna_destino` não são intercambiáveis, o achado A→B não implica B→A.
+
+| Coluna | Significado |
+|---|---|
+| `coluna_origem`, `coluna_destino` | Nomes das colunas candidatas |
+| `qtd_grupos_origem` | Quantos valores distintos a coluna de origem tem (= quantos grupos foram testados). Só é gravado como achado quando ≥ 3 grupos (`MINIMO_GRUPOS_ORIGEM_PARA_REPORTAR_FD`): com 2 grupos a "regra" é quase trivial |
+| `percentual_grupos_sem_excecao` | % dos grupos em que a coluna de destino assume um único valor. Só é gravado como achado quando ≥ 95% (ver `LIMIAR_ADERENCIA_PARA_REPORTAR_FD` no profiler) |
+| `qtd_linhas_excecao` | Contagem exata de linhas nos grupos que violam a dependência: informação que a correlação, por ser agregada, não fornece |
+| `qtd_linhas_avaliadas` | Quantas linhas de fato entraram na checagem (origem e destino não nulos): sem isso, um achado com 100% de aderência mas calculado sobre uma fração pequena da tabela parece "regra geral" sem essa ressalva |
+
+Candidatos a origem/destino: colunas `Categorical`, `Text` ou `Identifier` (uma coluna como `raiz_cnpj`, por exemplo, só entra aqui por já ter sido reclassificada como `Identifier`). Busca limitada por três tetos de custo computacional (configuráveis por variável de ambiente, ver `.env.example`): teto de colunas elegíveis para qualquer análise de pares, pré-filtro pelo V de Cramér já calculado em `fato_correlacao` (com desempate pelo número de valores distintos da origem, quando mais pares passam no pré-filtro do que o teto permite testar), e teto fixo de pares efetivamente testados.
 
 ### `fato_duplicatas`
 Grão: linha duplicada × execução. `linha_duplicada` (JSONB): o conteúdo bruto de uma linha que apareceu duplicada na amostra.
